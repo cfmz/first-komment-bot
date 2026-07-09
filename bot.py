@@ -33,7 +33,7 @@ BOT_TOKEN = "8807622473:AAHXPohZMOBpJm-75SQ-TaQ_oVazVOJ4wyY"
 # ---------- Константы ----------
 SESSION_FILE = "user_session"
 
-# ---------- Глобальное состояние (для всех общее) ----------
+# ---------- Глобальное состояние ----------
 state = {
     "client": None,
     "phone": None,
@@ -48,8 +48,7 @@ state = {
     "is_running": False,
     "running_task": None,
     "processing_callback": False,
-    # Для уведомлений владельцу (опционально)
-    "owner_chat_id": None,  # только для логов, не блокирует
+    "owner_chat_id": None,
 }
 
 bot_app = None
@@ -62,19 +61,16 @@ def log(msg: str, emoji: str = "•"):
 
 def parse_post_link(link: str):
     link = link.split('?')[0]
-    
     match = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if match:
         chat_id = -1000000000000 - int(match.group(1))
         msg_id = int(match.group(2))
         return chat_id, msg_id
-    
     match = re.search(r't\.me/([^/]+)/(\d+)', link)
     if match:
         username = match.group(1)
         msg_id = int(match.group(2))
         return username, msg_id
-    
     return None, None
 
 # ---------- Клавиатура ----------
@@ -94,15 +90,14 @@ def main_menu_keyboard():
     ]
     return InlineKeyboardMarkup(rows)
 
-# ---------- ПРОВЕРКА ДЛЯ ВСЕХ (без блокировки) ----------
+# ---------- ДЛЯ ВСЕХ ----------
 def authorized(update: Update) -> bool:
-    return True  # Все пользователи могут использовать
+    return True
 
 # ---------- Работа с клиентом ----------
 async def get_connected_client() -> TelegramClient:
     global _handler_registered
     client = state["client"]
-
     if client is not None:
         try:
             if not client.is_connected():
@@ -117,31 +112,26 @@ async def get_connected_client() -> TelegramClient:
                 os.remove(f"{SESSION_FILE}.session")
             client = None
             state["client"] = None
-
     new_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
     await new_client.connect()
     state["client"] = new_client
-
     if not _handler_registered:
         _handler_registered = True
         log("Клиент Telethon готов", "✅")
-
     return new_client
 
-# ---------- Функция отправки чисел ----------
+# ---------- Отправка чисел ----------
 async def send_numbers_task(chat, message_id, start, end, interval, owner_chat_id=None):
     try:
         current = start
         while current <= end and state["is_running"]:
             if not state["is_running"]:
                 break
-            
             try:
                 client = await get_connected_client()
                 await client.send_message(chat, str(current), comment_to=message_id)
                 log(f"Отправлено: {current}", "🔢")
                 state["current_number"] = current
-                
                 if current % 10 == 0 or current == start or current == end:
                     if owner_chat_id and bot_app:
                         try:
@@ -152,12 +142,9 @@ async def send_numbers_task(chat, message_id, start, end, interval, owner_chat_i
                             )
                         except:
                             pass
-                
                 current += 1
-                
                 if current <= end and state["is_running"]:
                     await asyncio.sleep(interval)
-                    
             except FloodWaitError as e:
                 log(f"FloodWait: {e.seconds} сек", "⏳")
                 if owner_chat_id and bot_app:
@@ -180,7 +167,6 @@ async def send_numbers_task(chat, message_id, start, end, interval, owner_chat_i
                     state["client"] = None
                 await asyncio.sleep(5)
                 continue
-        
         if current > end:
             log(f"✅ Готово! {end - start + 1} чисел", "🎉")
             if owner_chat_id and bot_app:
@@ -195,10 +181,8 @@ async def send_numbers_task(chat, message_id, start, end, interval, owner_chat_i
                     owner_chat_id,
                     f"⏹ Остановлено на числе {current}"
                 )
-        
         state["is_running"] = False
         state["running_task"] = None
-        
     except Exception as e:
         log(f"Критическая ошибка: {e}", "💀")
         state["is_running"] = False
@@ -209,11 +193,11 @@ async def send_numbers_task(chat, message_id, start, end, interval, owner_chat_i
                 f"❌ Ошибка: {e}"
             )
 
-# ---------- Команда /start (для всех) ----------
+# ---------- /start ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Запоминаем ID пользователя для логов
     if state["owner_chat_id"] is None:
         state["owner_chat_id"] = update.effective_chat.id
+        log(f"Первый пользователь: {state['owner_chat_id']}", "👤")
 
     client = state["client"]
     is_auth = False
@@ -236,13 +220,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_keyboard()
     )
 
-# ---------- Команда /cancel ----------
+# ---------- /cancel ----------
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state["pending_action"]:
         state["pending_action"] = None
         await update.message.reply_text("❌ Отменено.")
     else:
         await update.message.reply_text("Нет активного действия.")
+
+# ---------- ДИАГНОСТИКА: ответ на любое сообщение ----------
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"✅ Бот работает! Ты написал: {update.message.text}")
 
 # ---------- Обработчик callback ----------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,7 +253,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("✅ Вы уже авторизованы!")
                 state["processing_callback"] = False
                 return
-            
             state["pending_action"] = "await_phone"
             await query.message.reply_text("📱 Отправь номер:\n+79001234567")
 
@@ -275,12 +262,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("❌ Сначала войди!")
                 state["processing_callback"] = False
                 return
-            
             if state["is_running"]:
                 await query.message.reply_text("⚠️ Процесс уже запущен! Останови.")
                 state["processing_callback"] = False
                 return
-            
             state["pending_action"] = "await_post_link"
             await query.message.reply_text(
                 "📎 Отправь ссылку на пост:\n\n"
@@ -342,14 +327,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет активного действия.")
         return
 
-    # ----- ВВОД НОМЕРА -----
     if action == "await_phone":
         client = state["client"]
         if client and await client.is_user_authorized():
             await update.message.reply_text("✅ Вы уже авторизованы!")
             state["pending_action"] = None
             return
-        
         state["phone"] = text
         try:
             client = await get_connected_client()
@@ -365,7 +348,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_action"] = None
         return
 
-    # ----- ВВОД КОДА -----
     if action == "await_code":
         code = text.replace(" ", "").replace(".", "").replace("-", "")
         try:
@@ -384,7 +366,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_action"] = None
         return
 
-    # ----- ВВОД ПАРОЛЯ -----
     if action == "await_password":
         try:
             client = await get_connected_client()
@@ -396,21 +377,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_action"] = None
         return
 
-    # ----- ССЫЛКА НА ПОСТ -----
     if action == "await_post_link":
         chat_identifier, msg_id = parse_post_link(text)
         if not chat_identifier or not msg_id:
             await update.message.reply_text("❌ Неверная ссылка!\nПример: https://t.me/c/1234567890/123")
             return
-        
         state["target_message_id"] = msg_id
         state["target_chat_identifier"] = chat_identifier
-        
         state["pending_action"] = "await_start_number"
         await update.message.reply_text("🔢 Отправь число ОТ (например: 1)")
         return
 
-    # ----- НАЧАЛЬНОЕ ЧИСЛО -----
     if action == "await_start_number":
         try:
             start = int(text)
@@ -421,7 +398,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Отправь целое число!")
         return
 
-    # ----- КОНЕЧНОЕ ЧИСЛО -----
     if action == "await_end_number":
         try:
             end = int(text)
@@ -438,7 +414,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Отправь целое число!")
         return
 
-    # ----- ИНТЕРВАЛ (ЗАПУСК) -----
     if action == "await_interval":
         try:
             interval = float(text)
@@ -468,7 +443,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state["number_start"],
                 state["number_end"],
                 state["number_interval"],
-                update.effective_chat.id  # для уведомлений
+                update.effective_chat.id
             ))
             state["running_task"] = task
             
@@ -484,7 +459,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Отправь число!")
         return
 
-# ---------- Веб-сервер для Render ----------
+# ---------- Веб-сервер ----------
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -507,6 +482,9 @@ async def main():
     
     app = Application.builder().token(BOT_TOKEN).build()
     bot_app = app
+
+    # ДИАГНОСТИКА ПЕРВЫМ — ответит на любое сообщение
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
