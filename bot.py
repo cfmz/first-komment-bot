@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 from datetime import datetime, timezone
+from aiohttp import web
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -203,7 +204,7 @@ async def _send_with_retry(chat, message_id, text, title, key):
     else:
         state["notified_keys"].discard(key)
 
-# ---------- БЫСТРАЯ ОТПРАВКА (без лишних проверок) ----------
+# ---------- БЫСТРАЯ ОТПРАВКА ----------
 async def send_comment(chat, message_id: int, text: str) -> bool:
     for attempt in range(3):
         try:
@@ -434,11 +435,30 @@ async def keep_alive():
                         pass
                     state["client"] = None
 
+# ---------- ВЕБ-СЕРВЕР ДЛЯ RENDER (чтобы не перезапускал) ----------
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def run_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    await site.start()
+    log(f"Веб-сервер запущен на порту {os.getenv('PORT', 8080)}", "🌐")
+    # Держим сервер запущенным
+    await asyncio.Event().wait()
+
 # ---------- Запуск ----------
 async def main():
     global bot_app
     state["tracked_channels"] = load_channels()
     print("\n  ⚡ БОТ-КОММЕНТАТОР\n")
+    
+    # Запускаем веб-сервер для Render
+    asyncio.create_task(run_web_server())
+    
     app = Application.builder().token(BOT_TOKEN).build()
     bot_app = app
 
