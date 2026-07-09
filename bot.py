@@ -24,15 +24,11 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- Чтение секретов из переменных окружения ----------
-API_ID = int(os.getenv('API_ID', 0))
-API_HASH = os.getenv('API_HASH', '')
-BOT_TOKEN = os.getenv('BOT_TOKEN', '')
+# ---------- Данные из переменных окружения (или хардкод) ----------
+API_ID = int(os.getenv('API_ID', 22376342))
+API_HASH = os.getenv('API_HASH', 'f623dc4ae2b015463cfde7874ab0f270')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8807622473:AAHXPohZMOBpJm-75SQ-TaQ_oVazVOJ4wyY')
 
-if not API_ID or not API_HASH or not BOT_TOKEN:
-    raise ValueError("Не заданы обязательные переменные окружения: API_ID, API_HASH, BOT_TOKEN")
-
-# ---------- Остальные константы ----------
 SESSION_FILE = "user_session"
 CHANNELS_FILE = "channels.json"
 
@@ -47,10 +43,10 @@ state = {
     "draft_text": "🥇 Первый!",
     "pending_action": None,
     "tracked_channels": [],
+    "handler_registered": False,  # флаг, чтобы не дублировать обработчик
 }
 
 bot_app = None
-_handler_registered = False
 
 # ---------- Вспомогательные функции ----------
 def log(msg: str, emoji: str = "•"):
@@ -71,7 +67,7 @@ def save_channels(channels):
     with open(CHANNELS_FILE, "w") as f:
         json.dump(channels, f)
 
-# ---------- Клавиатуры с цветными кнопками ----------
+# ---------- Клавиатуры ----------
 def main_menu_keyboard():
     rows = [
         [
@@ -104,9 +100,9 @@ def channels_menu_keyboard():
     ]
     return InlineKeyboardMarkup(rows)
 
-# ---------- ВСЕ МОГУТ ПОЛЬЗОВАТЬСЯ ----------
+# ---------- Все могут пользоваться ----------
 def authorized(update: Update) -> bool:
-    return True  # <--- ВСЕ РАЗРЕШЕНЫ
+    return True
 
 def make_post_link(channel_id: int, message_id: int) -> str:
     chat_id_str = str(channel_id)
@@ -115,36 +111,52 @@ def make_post_link(channel_id: int, message_id: int) -> str:
         return f"https://t.me/c/{chat_id_clean}/{message_id}"
     return f"https://t.me/c/{channel_id}/{message_id}"
 
-# ---------- Работа с клиентом ----------
+# ---------- Клиент с сохранением сессии ----------
 async def get_connected_client() -> TelegramClient:
-    global _handler_registered
     client = state["client"]
 
+    # Если клиент уже есть, проверяем соединение
     if client is not None:
         try:
             if not client.is_connected():
                 await client.connect()
-            return client
-        except Exception:
+            # Проверяем авторизацию
+            if await client.is_user_authorized():
+                return client
+            else:
+                # Не авторизован — сбрасываем
+                log("Клиент не авторизован, пересоздаём", "⚠️")
+                await client.disconnect()
+                client = None
+                state["client"] = None
+        except Exception as e:
+            log(f"Ошибка клиента: {e}", "❌")
             try:
                 await client.disconnect()
             except:
                 pass
-            if os.path.exists(f"{SESSION_FILE}.session"):
-                os.remove(f"{SESSION_FILE}.session")
             client = None
             state["client"] = None
 
+    # Создаём нового клиента (сессия сохранится в файл)
     new_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
     await new_client.connect()
+    
+    # Проверяем, авторизован ли
+    if await new_client.is_user_authorized():
+        log("Сессия уже авторизована", "✅")
+    else:
+        log("Сессия не авторизована, нужен вход", "⚠️")
+    
     state["client"] = new_client
 
-    if not _handler_registered:
+    # Регистрируем обработчик сообщений ОДИН РАЗ
+    if not state["handler_registered"]:
         @new_client.on(events.NewMessage)
         async def handler(event):
             await handle_new_message(event)
-        _handler_registered = True
-        log("Обработчик Telethon зарегистрирован", "✅")
+        state["handler_registered"] = True
+        log("Обработчик событий зарегистрирован", "✅")
 
     return new_client
 
@@ -182,44 +194,47 @@ async def handle_new_message(event):
     title = getattr(chat, "title", str(chat.id))
     comment_text = fmt_draft(state["draft_text"])
 
+    log(f"Новый пост в {title}, отправляю: {comment_text}", "📢")
     asyncio.create_task(_send_with_retry(chat, event.message.id, comment_text, title, key))
 
 async def _send_with_retry(chat, message_id, text, title, key):
     success = await send_comment(chat, message_id, text)
 
     if success:
-        log(f"{title}: {text}", "💬")
+        log(f"✅ {title}: {text}", "💬")
     else:
+        log(f"❌ Не удалось отправить комментарий в {title}", "💀")
         state["notified_keys"].discard(key)
 
 async def send_comment(chat, message_id: int, text: str) -> bool:
     for attempt in range(3):
         try:
             client = await get_connected_client()
+            if not await client.is_user_authorized():
+                log("Клиент не авторизован, пропускаем", "⚠️")
+                return False
             await client.send_message(chat, text, comment_to=message_id)
             return True
         except FloodWaitError as e:
+            log(f"FloodWait {e.seconds} сек", "⏳")
             await asyncio.sleep(e.seconds)
             continue
         except Exception as e:
-            log(f"Ошибка (попытка {attempt+1}): {e}", "❌")
+            log(f"Ошибка отправки (попытка {attempt+1}): {e}", "❌")
+            # Сбрасываем клиент, чтобы пересоздать при следующей попытке
             if state["client"]:
                 try:
                     await state["client"].disconnect()
                 except:
                     pass
-            state["client"] = None
+                state["client"] = None
+            await asyncio.sleep(2)
     return False
 
-# ---------- Команды бота (для ВСЕХ) ----------
+# ---------- Команды бота ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    client = state["client"]
-    is_auth = False
-    if client:
-        try:
-            is_auth = await client.is_user_authorized()
-        except:
-            is_auth = False
+    client = await get_connected_client()
+    is_auth = await client.is_user_authorized() if client else False
 
     logged = "✅ Да" if is_auth else "❌ Нет"
     status = "🟢 Работает" if state["monitoring"] else "🔴 Остановлен"
@@ -247,12 +262,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "login":
+        client = await get_connected_client()
+        if await client.is_user_authorized():
+            await query.message.reply_text("✅ Вы уже авторизованы!")
+            return
         state["pending_action"] = "await_phone"
         await query.message.reply_text("📱 Отправь номер:\n+79001234567")
 
     elif data == "start_monitoring":
-        client = state["client"]
-        if client is None or not await client.is_user_authorized():
+        client = await get_connected_client()
+        if not await client.is_user_authorized():
             await query.message.reply_text("❌ Сначала войди!")
             return
         state["monitoring"] = True
@@ -295,21 +314,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client = state["client"]
         if client:
             try:
-                await client.log_out()
-            except:
-                pass
-            try:
+                # Не удаляем сессию, просто отключаем
                 await client.disconnect()
             except:
                 pass
-        if os.path.exists(f"{SESSION_FILE}.session"):
-            os.remove(f"{SESSION_FILE}.session")
         state["client"] = None
         state["monitoring"] = False
         state["notified_keys"].clear()
-        global _handler_registered
-        _handler_registered = False
-        await query.message.reply_text("🚪 Вышел!")
+        state["handler_registered"] = False
+        await query.message.reply_text("🚪 Вышел (сессия сохранена)")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = state["pending_action"]
@@ -330,7 +343,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await client.send_code_request(text)
             state["phone_code_hash"] = result.phone_code_hash
             state["pending_action"] = "await_code"
-            await update.message.reply_text("📩 Код отправлен!\n\n⚠️ Введи код через точки:\n1.8.3.8.3")
+            await update.message.reply_text("📩 Код отправлен!\nВведи код через точки: 1.8.3.8.3")
         except FloodWaitError as fw:
             await update.message.reply_text(f"⏳ Подожди {fw.seconds} секунд")
             state["pending_action"] = None
@@ -394,21 +407,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def keep_alive():
     while True:
         await asyncio.sleep(60)
-        if state["client"]:
-            try:
-                client = state["client"]
-                if not client.is_connected():
-                    await client.connect()
+        try:
+            client = state["client"]
+            if client and client.is_connected():
                 await client.get_me()
-            except Exception:
-                if state["client"]:
-                    try:
-                        await state["client"].disconnect()
-                    except:
-                        pass
-                    state["client"] = None
+        except Exception as e:
+            log(f"Keep-alive ошибка: {e}", "⚠️")
 
-# ---------- Веб-сервер для Render ----------
+# ---------- Веб-сервер ----------
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -419,7 +425,7 @@ async def run_web_server():
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
     await site.start()
-    log(f"Веб-сервер запущен на порту {os.getenv('PORT', 8080)}", "🌐")
+    log(f"Веб-сервер на порту {os.getenv('PORT', 8080)}", "🌐")
     await asyncio.Event().wait()
 
 # ---------- Запуск ----------
@@ -441,7 +447,7 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    log("Бот готов для ВСЕХ!", "✅")
+    log("Бот готов!", "✅")
     asyncio.create_task(keep_alive())
     await asyncio.Event().wait()
 
