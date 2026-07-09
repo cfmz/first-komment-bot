@@ -24,7 +24,7 @@ from telegram.ext import (
 # ---------- ТВОИ ДАННЫЕ ----------
 API_ID = 22376342
 API_HASH = "f623dc4ae2b015463cfde7874ab0f270"
-BOT_TOKEN = "8807622473:AAHXPohZMOBpJm-75SQ-TaQ_oVazVOJ4wyY"
+BOT_TOKEN = "8956643411:AAHU2b5FmZ2In7Bvf7XJebWxrylx9NOVwp0"
 
 SESSION_FILE = "user_session"
 CHANNELS_FILE = "channels.json"
