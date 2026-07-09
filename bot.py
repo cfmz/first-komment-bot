@@ -38,7 +38,6 @@ CHANNELS_FILE = "channels.json"
 
 # ---------- Глобальное состояние ----------
 state = {
-    "owner_chat_id": None,
     "client": None,
     "phone": None,
     "phone_code_hash": None,
@@ -105,11 +104,9 @@ def channels_menu_keyboard():
     ]
     return InlineKeyboardMarkup(rows)
 
-# ---------- Проверка авторизации ----------
+# ---------- ВСЕ МОГУТ ПОЛЬЗОВАТЬСЯ ----------
 def authorized(update: Update) -> bool:
-    if state["owner_chat_id"] is None:
-        return True
-    return update.effective_chat.id == state["owner_chat_id"]
+    return True  # <--- ВСЕ РАЗРЕШЕНЫ
 
 def make_post_link(channel_id: int, message_id: int) -> str:
     chat_id_str = str(channel_id)
@@ -118,7 +115,7 @@ def make_post_link(channel_id: int, message_id: int) -> str:
         return f"https://t.me/c/{chat_id_clean}/{message_id}"
     return f"https://t.me/c/{channel_id}/{message_id}"
 
-# ---------- Работа с клиентом (пересоздаётся при ошибке) ----------
+# ---------- Работа с клиентом ----------
 async def get_connected_client() -> TelegramClient:
     global _handler_registered
     client = state["client"]
@@ -192,19 +189,9 @@ async def _send_with_retry(chat, message_id, text, title, key):
 
     if success:
         log(f"{title}: {text}", "💬")
-        if state["owner_chat_id"] and bot_app:
-            try:
-                link = make_post_link(chat.id, message_id)
-                await bot_app.bot.send_message(
-                    state["owner_chat_id"],
-                    f"💬 Комментарий\n📢 {title}\n📝 {text}\n🔗 {link}"
-                )
-            except Exception as e:
-                log(f"Ошибка уведомления: {e}", "⚠️")
     else:
         state["notified_keys"].discard(key)
 
-# ---------- БЫСТРАЯ ОТПРАВКА ----------
 async def send_comment(chat, message_id: int, text: str) -> bool:
     for attempt in range(3):
         try:
@@ -224,14 +211,8 @@ async def send_comment(chat, message_id: int, text: str) -> bool:
             state["client"] = None
     return False
 
-# ---------- Команды бота ----------
+# ---------- Команды бота (для ВСЕХ) ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if state["owner_chat_id"] is None:
-        state["owner_chat_id"] = update.effective_chat.id
-
-    if not authorized(update):
-        return
-
     client = state["client"]
     is_auth = False
     if client:
@@ -254,8 +235,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        return
     if state["pending_action"]:
         state["pending_action"] = None
         await update.message.reply_text("❌ Отменено.")
@@ -264,9 +243,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not authorized(update):
-        await query.answer("Не авторизован")
-        return
     await query.answer()
     data = query.data
 
@@ -336,9 +312,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🚪 Вышел!")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        return
-
     action = state["pending_action"]
     text = update.message.text.strip()
 
@@ -435,7 +408,7 @@ async def keep_alive():
                         pass
                     state["client"] = None
 
-# ---------- ВЕБ-СЕРВЕР ДЛЯ RENDER (чтобы не перезапускал) ----------
+# ---------- Веб-сервер для Render ----------
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -447,16 +420,14 @@ async def run_web_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
     await site.start()
     log(f"Веб-сервер запущен на порту {os.getenv('PORT', 8080)}", "🌐")
-    # Держим сервер запущенным
     await asyncio.Event().wait()
 
 # ---------- Запуск ----------
 async def main():
     global bot_app
     state["tracked_channels"] = load_channels()
-    print("\n  ⚡ БОТ-КОММЕНТАТОР\n")
+    print("\n  ⚡ БОТ-КОММЕНТАТОР (ДЛЯ ВСЕХ)\n")
     
-    # Запускаем веб-сервер для Render
     asyncio.create_task(run_web_server())
     
     app = Application.builder().token(BOT_TOKEN).build()
@@ -470,7 +441,7 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    log("Бот готов!", "✅")
+    log("Бот готов для ВСЕХ!", "✅")
     asyncio.create_task(keep_alive())
     await asyncio.Event().wait()
 
