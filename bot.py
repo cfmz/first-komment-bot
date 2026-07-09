@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 from datetime import datetime, timezone
+from aiohttp import web
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -21,14 +22,15 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- ТВОИ ДАННЫЕ ----------
+# ---------- КОНФИГ ----------
 BOT_TOKEN = "8956643411:AAHU2b5FmZ2In7Bvf7XJebWxrylx9NOVwp0"
 API_ID = 22376342
 API_HASH = "f623dc4ae2b015463cfde7874ab0f270"
 
 CHANNELS_FILE = "channels.json"
+PORT = int(os.getenv("PORT", 8080))
 
-# ---------- СОСТОЯНИЯ ----------
+# ---------- СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЕЙ ----------
 user_states = {}
 
 def get_user_state(user_id):
@@ -108,11 +110,12 @@ def channels_menu_keyboard():
     ]
     return InlineKeyboardMarkup(rows)
 
-# ---------- КЛИЕНТ ----------
+# ---------- КЛИЕНТ С ПЕРЕСОЗДАНИЕМ ПРИ ОШИБКЕ ----------
 async def get_client(user_id):
     state = get_user_state(user_id)
     client = state["client"]
 
+    # Если клиент есть, пробуем использовать
     if client is not None:
         try:
             if not client.is_connected():
@@ -121,11 +124,17 @@ async def get_client(user_id):
                 state["is_authorized"] = await client.is_user_authorized()
             return client
         except Exception as e:
-            log(f"Ошибка клиента {user_id}: {e}", "❌")
+            log(f"Клиент {user_id} сломался: {e}", "❌")
+            # Удаляем старый клиент
+            try:
+                await client.disconnect()
+            except:
+                pass
             client = None
             state["client"] = None
             state["is_authorized"] = False
 
+    # Создаём новый
     session_file = f"user_session_{user_id}"
     new_client = TelegramClient(session_file, API_ID, API_HASH)
     await new_client.connect()
@@ -137,6 +146,7 @@ async def get_client(user_id):
     else:
         log(f"⚠️ {user_id} не авторизован", "⚠️")
 
+    # Регистрируем обработчик один раз
     if not state["handler_registered"]:
         @new_client.on(events.NewMessage)
         async def handler(event, uid=user_id):
@@ -145,7 +155,7 @@ async def get_client(user_id):
 
     return new_client
 
-# ---------- ОБРАБОТЧИК ПОСТОВ ----------
+# ---------- ОБРАБОТЧИК НОВЫХ ПОСТОВ ----------
 async def handle_new_message(event, user_id):
     state = get_user_state(user_id)
     if not state["monitoring"]:
@@ -200,13 +210,22 @@ async def send_comment(user_id, chat, message_id: int, text: str) -> bool:
             await client.send_message(chat, text, comment_to=message_id)
             return True
         except FloodWaitError as e:
+            log(f"⏳ FloodWait {e.seconds} сек для {user_id}", "⏳")
             await asyncio.sleep(e.seconds)
         except Exception as e:
             log(f"❌ [{user_id}] Ошибка {attempt+1}: {e}", "❌")
+            # Сбрасываем клиент, чтобы пересоздать
+            if state["client"]:
+                try:
+                    await state["client"].disconnect()
+                except:
+                    pass
+                state["client"] = None
+                state["is_authorized"] = False
             await asyncio.sleep(2)
     return False
 
-# ---------- КОМАНДЫ ----------
+# ---------- КОМАНДЫ БОТА ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     state = get_user_state(user_id)
@@ -250,7 +269,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state["is_authorized"]:
             await query.message.reply_text("✅ Уже авторизован!")
             return
-        # Сбрасываем всё, чтобы можно было ввести новый номер
         state["phone"] = None
         state["phone_code_hash"] = None
         state["pending_action"] = "await_phone"
@@ -322,14 +340,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет активного действия.")
         return
 
-    # ===== ВВОД НОМЕРА =====
     if action == "await_phone":
-        # СБРАСЫВАЕМ ВСЁ НАХУЙ — чтобы можно было ввести новый номер без флуда
-        state["phone"] = None
-        state["phone_code_hash"] = None
-        state["pending_action"] = None
-
         state["phone"] = text
+        state["phone_code_hash"] = None
+        state["pending_action"] = None  # временно сбрасываем
         try:
             client = await get_client(user_id)
             result = await client.send_code_request(text)
@@ -341,7 +355,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Telegram просит подождать {fw.seconds} секунд.\n"
                 f"Попробуй позже или используй другой номер."
             )
-            # Сбрасываем, чтобы можно было ввести новый номер
             state["pending_action"] = "await_phone"
             state["phone"] = None
             state["phone_code_hash"] = None
@@ -350,7 +363,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_action"] = None
         return
 
-    # ===== ВВОД КОДА =====
     if action == "await_code":
         code = text.replace(" ", "").replace(".", "").replace("-", "")
         try:
@@ -370,7 +382,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_action"] = None
         return
 
-    # ===== ВВОД ПАРОЛЯ =====
     if action == "await_password":
         try:
             client = await get_client(user_id)
@@ -383,14 +394,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_action"] = None
         return
 
-    # ===== ТЕКСТ КОММЕНТАРИЯ =====
     if action == "await_draft":
         state["draft_text"] = text
         state["pending_action"] = None
         await update.message.reply_text(f"✅ Новый текст:\n\n{text}")
         return
 
-    # ===== ДОБАВЛЕНИЕ КАНАЛА =====
     if action == "await_channel_add":
         channel = text.replace("@", "").strip()
         if channel and channel not in state["tracked_channels"]:
@@ -404,7 +413,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["pending_action"] = None
         return
 
-    # ===== УДАЛЕНИЕ КАНАЛА =====
     if action == "await_channel_remove":
         channel = text.replace("@", "").strip()
         if channel in state["tracked_channels"]:
@@ -417,6 +425,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Канал не найден в списке!")
         state["pending_action"] = None
         return
+
+# ---------- ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK ----------
+async def health(request):
+    return web.Response(text="OK")
+
+async def run_web():
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    log(f"🌐 Веб-сервер на порту {PORT}", "🌐")
+    await asyncio.Event().wait()
 
 # ---------- KEEP-ALIVE ----------
 async def keep_alive():
@@ -432,8 +455,10 @@ async def keep_alive():
 # ---------- ЗАПУСК ----------
 async def main():
     print("\n  ⚡ БОТ-КОММЕНТАТОР\n")
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Запускаем веб-сервер в фоне
+    asyncio.create_task(run_web())
 
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -442,9 +467,16 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    print("✅ БОТ ГОТОВ!")
+    log("✅ Бот готов!", "✅")
     asyncio.create_task(keep_alive())
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n  👋 Бот остановлен")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+        # Перезапуск при падении
+        os.execv(sys.executable, ['python'] + sys.argv)
