@@ -21,14 +21,14 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- НОВЫЙ ТОКЕН ----------
+# ---------- ТВОИ ДАННЫЕ ----------
 BOT_TOKEN = "8956643411:AAHU2b5FmZ2In7Bvf7XJebWxrylx9NOVwp0"
 API_ID = 22376342
 API_HASH = "f623dc4ae2b015463cfde7874ab0f270"
 
 CHANNELS_FILE = "channels.json"
 
-# ---------- СОСТОЯНИЕ ДЛЯ КАЖДОГО ПОЛЬЗОВАТЕЛЯ ----------
+# ---------- СОСТОЯНИЯ ----------
 user_states = {}
 
 def get_user_state(user_id):
@@ -48,7 +48,7 @@ def get_user_state(user_id):
         }
     return user_states[user_id]
 
-# ---------- ЗАГРУЗКА/СОХРАНЕНИЕ КАНАЛОВ ----------
+# ---------- БАЗА КАНАЛОВ ----------
 def load_channels():
     if os.path.exists(CHANNELS_FILE):
         with open(CHANNELS_FILE, "r") as f:
@@ -59,7 +59,7 @@ def save_channels(data):
     with open(CHANNELS_FILE, "w") as f:
         json.dump(data, f)
 
-# ---------- ФУНКЦИИ ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
 def log(msg: str, emoji: str = "•"):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"  [{ts}] {emoji} {msg}")
@@ -108,7 +108,7 @@ def channels_menu_keyboard():
     ]
     return InlineKeyboardMarkup(rows)
 
-# ---------- КЛИЕНТ ДЛЯ КОНКРЕТНОГО ПОЛЬЗОВАТЕЛЯ ----------
+# ---------- КЛИЕНТ ----------
 async def get_client(user_id):
     state = get_user_state(user_id)
     client = state["client"]
@@ -121,12 +121,11 @@ async def get_client(user_id):
                 state["is_authorized"] = await client.is_user_authorized()
             return client
         except Exception as e:
-            log(f"Ошибка клиента для {user_id}: {e}", "❌")
+            log(f"Ошибка клиента {user_id}: {e}", "❌")
             client = None
             state["client"] = None
             state["is_authorized"] = False
 
-    # Создаём нового клиента с уникальной сессией
     session_file = f"user_session_{user_id}"
     new_client = TelegramClient(session_file, API_ID, API_HASH)
     await new_client.connect()
@@ -134,21 +133,19 @@ async def get_client(user_id):
     state["is_authorized"] = await new_client.is_user_authorized()
 
     if state["is_authorized"]:
-        log(f"✅ Пользователь {user_id} авторизован", "✅")
+        log(f"✅ {user_id} авторизован", "✅")
     else:
-        log(f"⚠️ Пользователь {user_id} не авторизован", "⚠️")
+        log(f"⚠️ {user_id} не авторизован", "⚠️")
 
-    # Регистрируем обработчик для этого клиента, если ещё не зарегистрирован
     if not state["handler_registered"]:
         @new_client.on(events.NewMessage)
         async def handler(event, uid=user_id):
             await handle_new_message(event, uid)
         state["handler_registered"] = True
-        log(f"Обработчик для {user_id} зарегистрирован", "✅")
 
     return new_client
 
-# ---------- ОБРАБОТЧИК НОВЫХ СООБЩЕНИЙ (с привязкой к пользователю) ----------
+# ---------- ОБРАБОТЧИК ПОСТОВ ----------
 async def handle_new_message(event, user_id):
     state = get_user_state(user_id)
     if not state["monitoring"]:
@@ -162,7 +159,6 @@ async def handle_new_message(event, user_id):
     if not getattr(chat, "broadcast", False):
         return
 
-    # Проверка, отслеживается ли канал
     if state["tracked_channels"]:
         username = getattr(chat, "username", None)
         chat_id_str = str(chat.id)
@@ -200,7 +196,6 @@ async def send_comment(user_id, chat, message_id: int, text: str) -> bool:
         try:
             client = await get_client(user_id)
             if not state["is_authorized"]:
-                log(f"❌ [{user_id}] Не авторизован", "❌")
                 return False
             await client.send_message(chat, text, comment_to=message_id)
             return True
@@ -211,15 +206,14 @@ async def send_comment(user_id, chat, message_id: int, text: str) -> bool:
             await asyncio.sleep(2)
     return False
 
-# ---------- КОМАНДЫ БОТА ----------
+# ---------- КОМАНДЫ ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     state = get_user_state(user_id)
-    # Загружаем каналы пользователя
     all_channels = load_channels()
     state["tracked_channels"] = all_channels.get(str(user_id), [])
 
-    await get_client(user_id)  # проверим авторизацию
+    await get_client(user_id)
 
     logged = "✅ Да" if state["is_authorized"] else "❌ Нет"
     status = "🟢 Работает" if state["monitoring"] else "🔴 Остановлен"
@@ -243,6 +237,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Нет активного действия.")
 
+# ---------- ОБРАБОТЧИК КНОПОК ----------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     state = get_user_state(user_id)
@@ -255,6 +250,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state["is_authorized"]:
             await query.message.reply_text("✅ Уже авторизован!")
             return
+        # Сбрасываем всё, чтобы можно было ввести новый номер
+        state["phone"] = None
+        state["phone_code_hash"] = None
         state["pending_action"] = "await_phone"
         await query.message.reply_text("📱 Отправь номер:\n+79001234567")
 
@@ -265,9 +263,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["monitoring"] = True
         state["monitor_start_time"] = datetime.now(timezone.utc)
         state["notified_keys"].clear()
-        await query.message.reply_text(
-            f"▶️ ЗАПУЩЕНО!\n\n💬 {state['draft_text']}"
-        )
+        await query.message.reply_text(f"▶️ ЗАПУЩЕНО!\n\n💬 {state['draft_text']}")
 
     elif data == "stop_monitoring":
         state["monitoring"] = False
@@ -309,8 +305,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["monitoring"] = False
         state["notified_keys"].clear()
         state["handler_registered"] = False
-        await query.message.reply_text("🚪 Вышел (сессия сохранена)")
+        await query.message.reply_text("🚪 Вышел")
 
+# ---------- ОБРАБОТЧИК ТЕКСТА ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     state = get_user_state(user_id)
@@ -325,7 +322,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет активного действия.")
         return
 
+    # ===== ВВОД НОМЕРА =====
     if action == "await_phone":
+        # СБРАСЫВАЕМ ВСЁ НАХУЙ — чтобы можно было ввести новый номер без флуда
+        state["phone"] = None
+        state["phone_code_hash"] = None
+        state["pending_action"] = None
+
         state["phone"] = text
         try:
             client = await get_client(user_id)
@@ -334,13 +337,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["pending_action"] = "await_code"
             await update.message.reply_text("📩 Код отправлен!\nВведи код через точки: 1.8.3.8.3")
         except FloodWaitError as fw:
-            await update.message.reply_text(f"⏳ Подожди {fw.seconds} секунд")
-            state["pending_action"] = None
+            await update.message.reply_text(
+                f"⏳ Telegram просит подождать {fw.seconds} секунд.\n"
+                f"Попробуй позже или используй другой номер."
+            )
+            # Сбрасываем, чтобы можно было ввести новый номер
+            state["pending_action"] = "await_phone"
+            state["phone"] = None
+            state["phone_code_hash"] = None
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
             state["pending_action"] = None
+        return
 
-    elif action == "await_code":
+    # ===== ВВОД КОДА =====
+    if action == "await_code":
         code = text.replace(" ", "").replace(".", "").replace("-", "")
         try:
             client = await get_client(user_id)
@@ -357,8 +368,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
             state["pending_action"] = None
+        return
 
-    elif action == "await_password":
+    # ===== ВВОД ПАРОЛЯ =====
+    if action == "await_password":
         try:
             client = await get_client(user_id)
             await client.sign_in(password=text)
@@ -368,13 +381,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
             state["pending_action"] = None
+        return
 
-    elif action == "await_draft":
+    # ===== ТЕКСТ КОММЕНТАРИЯ =====
+    if action == "await_draft":
         state["draft_text"] = text
         state["pending_action"] = None
         await update.message.reply_text(f"✅ Новый текст:\n\n{text}")
+        return
 
-    elif action == "await_channel_add":
+    # ===== ДОБАВЛЕНИЕ КАНАЛА =====
+    if action == "await_channel_add":
         channel = text.replace("@", "").strip()
         if channel and channel not in state["tracked_channels"]:
             state["tracked_channels"].append(channel)
@@ -385,8 +402,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("⚠️ Канал уже в списке или пустой!")
         state["pending_action"] = None
+        return
 
-    elif action == "await_channel_remove":
+    # ===== УДАЛЕНИЕ КАНАЛА =====
+    if action == "await_channel_remove":
         channel = text.replace("@", "").strip()
         if channel in state["tracked_channels"]:
             state["tracked_channels"].remove(channel)
@@ -397,29 +416,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("⚠️ Канал не найден в списке!")
         state["pending_action"] = None
+        return
 
 # ---------- KEEP-ALIVE ----------
 async def keep_alive():
     while True:
         await asyncio.sleep(60)
-        for user_id, state in user_states.items():
-            if state["client"] and state["client"].is_connected():
+        for uid, st in user_states.items():
+            if st["client"] and st["client"].is_connected():
                 try:
-                    await state["client"].get_me()
+                    await st["client"].get_me()
                 except:
                     pass
 
 # ---------- ЗАПУСК ----------
 async def main():
-    # Загружаем каналы при старте (для всех пользователей)
-    all_channels = load_channels()
-    for uid_str, channels in all_channels.items():
-        uid = int(uid_str)
-        state = get_user_state(uid)
-        state["tracked_channels"] = channels
-
-    print("\n  ⚡ БОТ-КОММЕНТАТОР (МНОГОПОЛЬЗОВАТЕЛЬСКИЙ)\n")
-
+    print("\n  ⚡ БОТ-КОММЕНТАТОР\n")
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
