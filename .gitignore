@@ -1,0 +1,4 @@
+*.session
+channels.json
+__pycache__/
+.env
