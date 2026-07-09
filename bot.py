@@ -10,8 +10,6 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     FloodWaitError,
-    AuthKeyError,
-    UnauthorizedError,
 )
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,10 +22,10 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- Данные из переменных окружения (или хардкод) ----------
-API_ID = int(os.getenv('API_ID', 22376342))
-API_HASH = os.getenv('API_HASH', 'f623dc4ae2b015463cfde7874ab0f270')
-BOT_TOKEN = os.getenv('BOT_TOKEN', '8807622473:AAHXPohZMOBpJm-75SQ-TaQ_oVazVOJ4wyY')
+# ---------- ЖЁСТКИЙ ХАРДКОД (твои данные) ----------
+API_ID = 22376342
+API_HASH = "f623dc4ae2b015463cfde7874ab0f270"
+BOT_TOKEN = "8807622473:AAHXPohZMOBpJm-75SQ-TaQ_oVazVOJ4wyY"
 
 SESSION_FILE = "user_session"
 CHANNELS_FILE = "channels.json"
@@ -35,6 +33,7 @@ CHANNELS_FILE = "channels.json"
 # ---------- Глобальное состояние ----------
 state = {
     "client": None,
+    "is_authorized": False,          # <--- Флаг авторизации
     "phone": None,
     "phone_code_hash": None,
     "monitoring": False,
@@ -43,7 +42,7 @@ state = {
     "draft_text": "🥇 Первый!",
     "pending_action": None,
     "tracked_channels": [],
-    "handler_registered": False,  # флаг, чтобы не дублировать обработчик
+    "handler_registered": False,
 }
 
 bot_app = None
@@ -111,54 +110,42 @@ def make_post_link(channel_id: int, message_id: int) -> str:
         return f"https://t.me/c/{chat_id_clean}/{message_id}"
     return f"https://t.me/c/{channel_id}/{message_id}"
 
-# ---------- Клиент с сохранением сессии ----------
-async def get_connected_client() -> TelegramClient:
-    client = state["client"]
-
-    # Если клиент уже есть, проверяем соединение
-    if client is not None:
+# ---------- Клиент (ОДИН на всё время) ----------
+async def get_client():
+    """Возвращает клиент, создаёт если нет, проверяет авторизацию"""
+    if state["client"] is not None:
         try:
-            if not client.is_connected():
-                await client.connect()
+            if not state["client"].is_connected():
+                await state["client"].connect()
             # Проверяем авторизацию
-            if await client.is_user_authorized():
-                return client
-            else:
-                # Не авторизован — сбрасываем
-                log("Клиент не авторизован, пересоздаём", "⚠️")
-                await client.disconnect()
-                client = None
-                state["client"] = None
+            if not state["is_authorized"]:
+                state["is_authorized"] = await state["client"].is_user_authorized()
+            return state["client"]
         except Exception as e:
             log(f"Ошибка клиента: {e}", "❌")
-            try:
-                await client.disconnect()
-            except:
-                pass
-            client = None
             state["client"] = None
+            state["is_authorized"] = False
 
-    # Создаём нового клиента (сессия сохранится в файл)
-    new_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
-    await new_client.connect()
+    # Создаём новый клиент
+    client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+    await client.connect()
+    state["client"] = client
+    state["is_authorized"] = await client.is_user_authorized()
     
-    # Проверяем, авторизован ли
-    if await new_client.is_user_authorized():
-        log("Сессия уже авторизована", "✅")
+    if state["is_authorized"]:
+        log("✅ Сессия уже авторизована", "✅")
     else:
-        log("Сессия не авторизована, нужен вход", "⚠️")
-    
-    state["client"] = new_client
+        log("⚠️ Сессия НЕ авторизована, нужен вход", "⚠️")
 
-    # Регистрируем обработчик сообщений ОДИН РАЗ
+    # Регистрируем обработчик событий ОДИН РАЗ
     if not state["handler_registered"]:
-        @new_client.on(events.NewMessage)
+        @client.on(events.NewMessage)
         async def handler(event):
             await handle_new_message(event)
         state["handler_registered"] = True
         log("Обработчик событий зарегистрирован", "✅")
 
-    return new_client
+    return client
 
 # ---------- Обработчик новых сообщений ----------
 async def handle_new_message(event):
@@ -194,7 +181,7 @@ async def handle_new_message(event):
     title = getattr(chat, "title", str(chat.id))
     comment_text = fmt_draft(state["draft_text"])
 
-    log(f"Новый пост в {title}, отправляю: {comment_text}", "📢")
+    log(f"📢 Новый пост в {title} → {comment_text}", "📢")
     asyncio.create_task(_send_with_retry(chat, event.message.id, comment_text, title, key))
 
 async def _send_with_retry(chat, message_id, text, title, key):
@@ -203,38 +190,30 @@ async def _send_with_retry(chat, message_id, text, title, key):
     if success:
         log(f"✅ {title}: {text}", "💬")
     else:
-        log(f"❌ Не удалось отправить комментарий в {title}", "💀")
+        log(f"❌ Не удалось в {title}", "💀")
         state["notified_keys"].discard(key)
 
 async def send_comment(chat, message_id: int, text: str) -> bool:
     for attempt in range(3):
         try:
-            client = await get_connected_client()
-            if not await client.is_user_authorized():
-                log("Клиент не авторизован, пропускаем", "⚠️")
+            client = await get_client()
+            if not state["is_authorized"]:
+                log("❌ Не авторизован, пропускаем", "❌")
                 return False
             await client.send_message(chat, text, comment_to=message_id)
             return True
         except FloodWaitError as e:
-            log(f"FloodWait {e.seconds} сек", "⏳")
+            log(f"⏳ FloodWait {e.seconds} сек", "⏳")
             await asyncio.sleep(e.seconds)
-            continue
         except Exception as e:
-            log(f"Ошибка отправки (попытка {attempt+1}): {e}", "❌")
-            # Сбрасываем клиент, чтобы пересоздать при следующей попытке
-            if state["client"]:
-                try:
-                    await state["client"].disconnect()
-                except:
-                    pass
-                state["client"] = None
+            log(f"❌ Ошибка отправки (попытка {attempt+1}): {e}", "❌")
             await asyncio.sleep(2)
     return False
 
 # ---------- Команды бота ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    client = await get_connected_client()
-    is_auth = await client.is_user_authorized() if client else False
+    client = await get_client()
+    is_auth = state["is_authorized"]
 
     logged = "✅ Да" if is_auth else "❌ Нет"
     status = "🟢 Работает" if state["monitoring"] else "🔴 Остановлен"
@@ -262,16 +241,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "login":
-        client = await get_connected_client()
-        if await client.is_user_authorized():
-            await query.message.reply_text("✅ Вы уже авторизованы!")
+        client = await get_client()
+        if state["is_authorized"]:
+            await query.message.reply_text("✅ Уже авторизован!")
             return
         state["pending_action"] = "await_phone"
         await query.message.reply_text("📱 Отправь номер:\n+79001234567")
 
     elif data == "start_monitoring":
-        client = await get_connected_client()
-        if not await client.is_user_authorized():
+        if not state["is_authorized"]:
             await query.message.reply_text("❌ Сначала войди!")
             return
         state["monitoring"] = True
@@ -311,14 +289,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_start(update, context)
 
     elif data == "logout":
-        client = state["client"]
-        if client:
+        # НЕ УДАЛЯЕМ СЕССИЮ — просто отключаем
+        if state["client"]:
             try:
-                # Не удаляем сессию, просто отключаем
-                await client.disconnect()
+                await state["client"].disconnect()
             except:
                 pass
         state["client"] = None
+        state["is_authorized"] = False
         state["monitoring"] = False
         state["notified_keys"].clear()
         state["handler_registered"] = False
@@ -339,7 +317,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "await_phone":
         state["phone"] = text
         try:
-            client = await get_connected_client()
+            client = await get_client()
             result = await client.send_code_request(text)
             state["phone_code_hash"] = result.phone_code_hash
             state["pending_action"] = "await_code"
@@ -354,8 +332,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "await_code":
         code = text.replace(" ", "").replace(".", "").replace("-", "")
         try:
-            client = await get_connected_client()
+            client = await get_client()
             await client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["phone_code_hash"])
+            state["is_authorized"] = True
             state["pending_action"] = None
             await update.message.reply_text("✅ Успешный вход!", reply_markup=main_menu_keyboard())
         except SessionPasswordNeededError:
@@ -370,8 +349,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "await_password":
         try:
-            client = await get_connected_client()
+            client = await get_client()
             await client.sign_in(password=text)
+            state["is_authorized"] = True
             state["pending_action"] = None
             await update.message.reply_text("✅ Успешный вход!", reply_markup=main_menu_keyboard())
         except Exception as e:
@@ -408,11 +388,10 @@ async def keep_alive():
     while True:
         await asyncio.sleep(60)
         try:
-            client = state["client"]
-            if client and client.is_connected():
-                await client.get_me()
-        except Exception as e:
-            log(f"Keep-alive ошибка: {e}", "⚠️")
+            if state["client"] and state["client"].is_connected():
+                await state["client"].get_me()
+        except Exception:
+            pass
 
 # ---------- Веб-сервер ----------
 async def health_check(request):
