@@ -1,10 +1,11 @@
-# bot.py
+# bot.py — полный код с Web-сервером
 import asyncio
 import json
 import logging
 import os
 import traceback
 from datetime import datetime, timezone
+from threading import Thread
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -26,6 +27,7 @@ from telegram.ext import (
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+import uvicorn
 
 # ══════════════════════════════════════════════
 # 🔐 ДАННЫЕ
@@ -524,13 +526,10 @@ async def main():
 
 
 if __name__ == "__main__":
-    import uvicorn
-    from threading import Thread
-
-    def run_fastapi():
+    def run_web():
         uvicorn.run(fastapi_app, host="0.0.0.0", port=PORT)
 
-    Thread(target=run_fastapi, daemon=True).start()
+    Thread(target=run_web, daemon=True).start()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
