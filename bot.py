@@ -1,8 +1,9 @@
-import os
 import asyncio
 import json
+import logging
+import os
+import traceback
 from datetime import datetime, timezone
-from aiohttp import web
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -22,53 +23,85 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- КОНФИГ ----------
-BOT_TOKEN = "8956643411:AAHU2b5FmZ2In7Bvf7XJebWxrylx9NOVwp0"
+# ══════════════════════════════════════════════
+# 🔐 ДАННЫЕ
+# ══════════════════════════════════════════════
 API_ID = 22376342
 API_HASH = "f623dc4ae2b015463cfde7874ab0f270"
-
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8997883874:AAG1H8eF-b2y47kXV82uxwtlzQ_zrSxgzE8")
+SESSION_FILE = "user_session"
 CHANNELS_FILE = "channels.json"
-PORT = int(os.getenv("PORT", 8080))
 
-# ---------- СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЕЙ ----------
-user_states = {}
+# ══════════════════════════════════════════════
+# 📝 ЛОГИРОВАНИЕ
+# ══════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-def get_user_state(user_id):
-    if user_id not in user_states:
-        user_states[user_id] = {
-            "client": None,
-            "is_authorized": False,
-            "phone": None,
-            "phone_code_hash": None,
-            "monitoring": False,
-            "monitor_start_time": None,
-            "notified_keys": set(),
-            "draft_text": "🥇 Первый!",
-            "pending_action": None,
-            "tracked_channels": [],
-            "handler_registered": False,
-        }
-    return user_states[user_id]
+# ══════════════════════════════════════════════
+# 📦 СОСТОЯНИЕ
+# ══════════════════════════════════════════════
+state = {
+    "owner_chat_id": None,
+    "client": None,
+    "phone": None,
+    "phone_code_hash": None,
+    "monitoring": False,
+    "monitor_start_time": None,
+    "notified_keys": set(),
+    "draft_text": "🥇 Первый!",
+    "pending_action": None,
+    "tracked_channels": [],
+    "first_comment_sent": False,
+}
 
-# ---------- БАЗА КАНАЛОВ ----------
+bot_app = None
+
+
+# ══════════════════════════════════════════════
+# 🛠️ ИНСТРУМЕНТЫ
+# ══════════════════════════════════════════════
+
+def fmt_draft(text: str) -> str:
+    now = datetime.now()
+    return text.replace("{time}", now.strftime("%H:%M")).replace(
+        "{date}", now.strftime("%d.%m.%Y")
+    )
+
+
 def load_channels():
     if os.path.exists(CHANNELS_FILE):
         with open(CHANNELS_FILE, "r") as f:
             return json.load(f)
-    return {}
+    return []
 
-def save_channels(data):
+
+def save_channels(channels):
     with open(CHANNELS_FILE, "w") as f:
-        json.dump(data, f)
+        json.dump(channels, f)
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
-def log(msg: str, emoji: str = "•"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"  [{ts}] {emoji} {msg}")
 
-def fmt_draft(text: str) -> str:
-    now = datetime.now()
-    return text.replace("{time}", now.strftime("%H:%M")).replace("{date}", now.strftime("%d.%m.%Y"))
+def main_menu_keyboard():
+    rows = [
+        [InlineKeyboardButton("🔐 Войти", callback_data="login"),
+         InlineKeyboardButton("▶️ Запустить", callback_data="start_monitoring")],
+        [InlineKeyboardButton("⏹ Остановить", callback_data="stop_monitoring"),
+         InlineKeyboardButton("✏️ Текст", callback_data="set_draft")],
+        [InlineKeyboardButton("📋 Каналы", callback_data="manage_channels"),
+         InlineKeyboardButton("🚪 Выйти", callback_data="logout")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def authorized(update: Update) -> bool:
+    if state["owner_chat_id"] is None:
+        return True
+    return update.effective_chat.id == state["owner_chat_id"]
+
 
 def make_post_link(channel_id: int, message_id: int) -> str:
     chat_id_str = str(channel_id)
@@ -77,93 +110,68 @@ def make_post_link(channel_id: int, message_id: int) -> str:
         return f"https://t.me/c/{chat_id_clean}/{message_id}"
     return f"https://t.me/c/{channel_id}/{message_id}"
 
-# ---------- КЛАВИАТУРЫ ----------
-def main_menu_keyboard():
-    rows = [
-        [
-            InlineKeyboardButton("🔐 Войти", callback_data="login", style="primary"),
-            InlineKeyboardButton("▶️ Запустить", callback_data="start_monitoring", style="success")
-        ],
-        [
-            InlineKeyboardButton("⏹ Остановить", callback_data="stop_monitoring", style="danger"),
-            InlineKeyboardButton("✏️ Текст", callback_data="set_draft", style="primary")
-        ],
-        [
-            InlineKeyboardButton("📋 Каналы", callback_data="manage_channels", style="primary"),
-            InlineKeyboardButton("🚪 Выйти", callback_data="logout", style="danger")
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
 
-def channels_menu_keyboard():
-    rows = [
-        [
-            InlineKeyboardButton("➕ Добавить", callback_data="add_channel", style="success"),
-            InlineKeyboardButton("❌ Удалить", callback_data="remove_channel", style="danger")
-        ],
-        [
-            InlineKeyboardButton("🌍 Все каналы", callback_data="all_channels", style="primary"),
-        ],
-        [
-            InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu", style="primary")
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
+# ══════════════════════════════════════════════
+# 🔌 TELETHON КЛИЕНТ
+# ══════════════════════════════════════════════
 
-# ---------- КЛИЕНТ С ПЕРЕСОЗДАНИЕМ ПРИ ОШИБКЕ ----------
-async def get_client(user_id):
-    state = get_user_state(user_id)
+async def get_connected_client() -> TelegramClient:
     client = state["client"]
 
-    # Если клиент есть, пробуем использовать
     if client is not None:
         try:
-            if not client.is_connected():
-                await client.connect()
-            if not state["is_authorized"]:
-                state["is_authorized"] = await client.is_user_authorized()
-            return client
-        except Exception as e:
-            log(f"Клиент {user_id} сломался: {e}", "❌")
-            # Удаляем старый клиент
-            try:
-                await client.disconnect()
-            except:
-                pass
-            client = None
-            state["client"] = None
-            state["is_authorized"] = False
+            if client.is_connected():
+                return client
+        except Exception:
+            logger.warning("Клиент не отвечает, пробую переподключить...")
 
-    # Создаём новый
-    session_file = f"user_session_{user_id}"
-    new_client = TelegramClient(session_file, API_ID, API_HASH)
+    if client is not None:
+        try:
+            await client.connect()
+            if client.is_connected():
+                logger.info("🔄 Клиент переподключен")
+                return client
+        except Exception as e:
+            if "AuthRestartError" in str(e) or "restart" in str(e).lower():
+                logger.warning("Сессия сломана, удаляю файл...")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                if os.path.exists(f"{SESSION_FILE}.session"):
+                    os.remove(f"{SESSION_FILE}.session")
+                client = None
+                state["client"] = None
+            else:
+                logger.error(f"Ошибка переподключения: {e}")
+
+    logger.info("Создаю новый Telethon-клиент")
+    new_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
     await new_client.connect()
     state["client"] = new_client
-    state["is_authorized"] = await new_client.is_user_authorized()
-
-    if state["is_authorized"]:
-        log(f"✅ {user_id} авторизован", "✅")
-    else:
-        log(f"⚠️ {user_id} не авторизован", "⚠️")
-
-    # Регистрируем обработчик один раз
-    if not state["handler_registered"]:
-        @new_client.on(events.NewMessage)
-        async def handler(event, uid=user_id):
-            await handle_new_message(event, uid)
-        state["handler_registered"] = True
-
+    if state["monitoring"]:
+        register_handler(new_client)
     return new_client
 
-# ---------- ОБРАБОТЧИК НОВЫХ ПОСТОВ ----------
-async def handle_new_message(event, user_id):
-    state = get_user_state(user_id)
+
+def register_handler(client: TelegramClient):
+    @client.on(events.NewMessage)
+    async def _handler(event):
+        await handle_new_message(event)
+
+
+# ══════════════════════════════════════════════
+# 📡 ОБРАБОТКА НОВЫХ ПОСТОВ
+# ══════════════════════════════════════════════
+
+async def handle_new_message(event):
     if not state["monitoring"]:
         return
     if not event.is_channel:
         return
 
     chat = await event.get_chat()
+
     if getattr(chat, "megagroup", False):
         return
     if not getattr(chat, "broadcast", False):
@@ -189,52 +197,98 @@ async def handle_new_message(event, user_id):
     title = getattr(chat, "title", str(chat.id))
     comment_text = fmt_draft(state["draft_text"])
 
-    log(f"📢 [{user_id}] {title} → {comment_text}", "📢")
-    asyncio.create_task(_send_with_retry(user_id, chat, event.message.id, comment_text, title, key))
+    logger.info(f"📩 Новый пост в канале: {title}")
 
-async def _send_with_retry(user_id, chat, message_id, text, title, key):
-    success = await send_comment(user_id, chat, message_id, text)
-    state = get_user_state(user_id)
+    asyncio.create_task(_send_with_retry(chat.id, event.message.id, comment_text, title, key))
+
+
+async def _send_with_retry(channel_id, message_id, text, title, key):
+    logger.info(f"Попытка отправки комментария в канал: {title}")
+    success = await send_comment(channel_id, message_id, text)
+
     if success:
-        log(f"✅ [{user_id}] {title}: {text}", "💬")
+        logger.info(f"✅ Комментарий опубликован: {title} — {text}")
+        print(f">>> {title}: {text}")
+
+        # ── Уведомление владельцу ──
+        if state["owner_chat_id"] and bot_app:
+            try:
+                link = make_post_link(channel_id, message_id)
+                await bot_app.bot.send_message(
+                    state["owner_chat_id"],
+                    f"💬 Комментарий\n📢 {title}\n📝 {text}\n🔗 {link}"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление: {e}")
+
+        # ── Первый комментарий за запуск ──
+        if not state["first_comment_sent"]:
+            state["first_comment_sent"] = True
+            if state["owner_chat_id"] and bot_app:
+                try:
+                    link = make_post_link(channel_id, message_id)
+                    now = datetime.now().strftime("%H:%M:%S")
+                    await bot_app.bot.send_message(
+                        state["owner_chat_id"],
+                        f"🎉 Первый комментарий опубликован!\n\n"
+                        f"📢 Канал: {title}\n"
+                        f"📝 Пост: {link}\n"
+                        f"💬 Комментарий:\n{text}\n"
+                        f"🕒 Время: {now}"
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось отправить уведомление о первом комментарии: {e}")
     else:
+        logger.error(f"❌ Не удалось отправить комментарий в канал: {title}")
         state["notified_keys"].discard(key)
 
-async def send_comment(user_id, chat, message_id: int, text: str) -> bool:
-    state = get_user_state(user_id)
-    for attempt in range(3):
+
+async def send_comment(channel_id: int, message_id: int, text: str) -> bool:
+    for attempt in range(1, 4):
         try:
-            client = await get_client(user_id)
-            if not state["is_authorized"]:
-                return False
-            await client.send_message(chat, text, comment_to=message_id)
-            return True
-        except FloodWaitError as e:
-            log(f"⏳ FloodWait {e.seconds} сек для {user_id}", "⏳")
-            await asyncio.sleep(e.seconds)
+            client = await get_connected_client()
+            entity = await client.get_entity(channel_id)
+
+            try:
+                await client.send_message(entity, text, comment_to=message_id)
+                return True
+            except Exception:
+                pass
+
+            try:
+                await client.send_message(entity, text, reply_to=message_id)
+                return True
+            except Exception:
+                pass
+
+            try:
+                await client.send_message(entity, text)
+                return True
+            except Exception:
+                pass
+
+        except FloodWaitError as fw:
+            logger.warning(f"⏳ FloodWait: {fw.seconds}с (попытка {attempt})")
         except Exception as e:
-            log(f"❌ [{user_id}] Ошибка {attempt+1}: {e}", "❌")
-            # Сбрасываем клиент, чтобы пересоздать
-            if state["client"]:
-                try:
-                    await state["client"].disconnect()
-                except:
-                    pass
-                state["client"] = None
-                state["is_authorized"] = False
-            await asyncio.sleep(2)
+            logger.error(f"Ошибка отправки (попытка {attempt}): {e}")
+            state["client"] = None
+
     return False
 
-# ---------- КОМАНДЫ БОТА ----------
+
+# ══════════════════════════════════════════════
+# 🤖 КОМАНДЫ БОТА
+# ══════════════════════════════════════════════
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    state = get_user_state(user_id)
-    all_channels = load_channels()
-    state["tracked_channels"] = all_channels.get(str(user_id), [])
+    if state["owner_chat_id"] is None:
+        state["owner_chat_id"] = update.effective_chat.id
+        logger.info(f"Владелец бота: {state['owner_chat_id']}")
 
-    await get_client(user_id)
+    if not authorized(update):
+        return
 
-    logged = "✅ Да" if state["is_authorized"] else "❌ Нет"
+    logged = "✅ Да" if (state["client"] and await state["client"].is_user_authorized()) else "❌ Нет"
     status = "🟢 Работает" if state["monitoring"] else "🔴 Остановлен"
     channels_info = f"{len(state['tracked_channels'])} шт" if state["tracked_channels"] else "Все"
 
@@ -247,44 +301,38 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_keyboard()
     )
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    state = get_user_state(user_id)
-    if state["pending_action"]:
-        state["pending_action"] = None
-        await update.message.reply_text("❌ Отменено.")
-    else:
-        await update.message.reply_text("Нет активного действия.")
 
-# ---------- ОБРАБОТЧИК КНОПОК ----------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    state = get_user_state(user_id)
     query = update.callback_query
+
+    if not authorized(update):
+        await query.answer("Не авторизован")
+        return
+
     await query.answer()
     data = query.data
 
     if data == "login":
-        await get_client(user_id)
-        if state["is_authorized"]:
-            await query.message.reply_text("✅ Уже авторизован!")
-            return
-        state["phone"] = None
-        state["phone_code_hash"] = None
         state["pending_action"] = "await_phone"
         await query.message.reply_text("📱 Отправь номер:\n+79001234567")
 
     elif data == "start_monitoring":
-        if not state["is_authorized"]:
+        client = state["client"]
+        if client is None or not await client.is_user_authorized():
             await query.message.reply_text("❌ Сначала войди!")
             return
+
         state["monitoring"] = True
         state["monitor_start_time"] = datetime.now(timezone.utc)
         state["notified_keys"].clear()
-        await query.message.reply_text(f"▶️ ЗАПУЩЕНО!\n\n💬 {state['draft_text']}")
+        state["first_comment_sent"] = False
+        register_handler(await get_connected_client())
+        logger.info("▶️ Мониторинг запущен")
+        await query.message.reply_text(f"▶️ ЗАПУЩЕНО!\n\n💬 {state['draft_text']}\n⚡ Мгновенно")
 
     elif data == "stop_monitoring":
         state["monitoring"] = False
+        logger.info("⏹ Мониторинг остановлен")
         await query.message.reply_text("⏹ Остановлено!")
 
     elif data == "set_draft":
@@ -292,7 +340,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("✏️ Отправь текст:\nМожно {time} и {date}")
 
     elif data == "manage_channels":
-        await query.message.reply_text("📋 Управление каналами", reply_markup=channels_menu_keyboard())
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить", callback_data="add_channel"),
+             InlineKeyboardButton("❌ Удалить", callback_data="remove_channel")],
+            [InlineKeyboardButton("🌍 Все каналы", callback_data="all_channels")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")],
+        ]
+        await query.message.reply_text("📋 Управление каналами", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data == "add_channel":
         state["pending_action"] = "await_channel_add"
@@ -304,179 +358,162 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "all_channels":
         state["tracked_channels"] = []
-        all_channels = load_channels()
-        all_channels[str(user_id)] = []
-        save_channels(all_channels)
+        save_channels([])
         await query.message.reply_text("🌍 Все каналы!")
 
     elif data == "back_to_menu":
         await cmd_start(update, context)
 
     elif data == "logout":
-        if state["client"]:
+        client = state["client"]
+        if client:
             try:
-                await state["client"].disconnect()
-            except:
+                await client.log_out()
+            except Exception:
                 pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        if os.path.exists(f"{SESSION_FILE}.session"):
+            os.remove(f"{SESSION_FILE}.session")
         state["client"] = None
-        state["is_authorized"] = False
         state["monitoring"] = False
         state["notified_keys"].clear()
-        state["handler_registered"] = False
-        await query.message.reply_text("🚪 Вышел")
+        logger.info("🚪 Пользователь вышел из аккаунта")
+        await query.message.reply_text("🚪 Вышел!")
 
-# ---------- ОБРАБОТЧИК ТЕКСТА ----------
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    state = get_user_state(user_id)
+    if not authorized(update):
+        return
+
     action = state["pending_action"]
     text = update.message.text.strip()
 
-    if text.lower() == "/cancel":
-        if action:
-            state["pending_action"] = None
-            await update.message.reply_text("❌ Отменено.")
-        else:
-            await update.message.reply_text("Нет активного действия.")
-        return
-
     if action == "await_phone":
         state["phone"] = text
-        state["phone_code_hash"] = None
-        state["pending_action"] = None  # временно сбрасываем
         try:
-            client = await get_client(user_id)
+            client = await get_connected_client()
             result = await client.send_code_request(text)
             state["phone_code_hash"] = result.phone_code_hash
             state["pending_action"] = "await_code"
-            await update.message.reply_text("📩 Код отправлен!\nВведи код через точки: 1.8.3.8.3")
+            logger.info(f"Код отправлен на номер {text[:5]}...")
+            await update.message.reply_text("📩 Код отправлен!\n\n⚠️ Через точки:\n1.8.3.8.3")
         except FloodWaitError as fw:
-            await update.message.reply_text(
-                f"⏳ Telegram просит подождать {fw.seconds} секунд.\n"
-                f"Попробуй позже или используй другой номер."
-            )
-            state["pending_action"] = "await_phone"
-            state["phone"] = None
-            state["phone_code_hash"] = None
+            logger.warning(f"FloodWait при отправке кода: {fw.seconds}с")
+            await update.message.reply_text(f"⏳ Подожди {fw.seconds} секунд")
         except Exception as e:
+            logger.error(f"Ошибка отправки кода: {traceback.format_exc()}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
             state["pending_action"] = None
-        return
 
-    if action == "await_code":
+    elif action == "await_code":
         code = text.replace(" ", "").replace(".", "").replace("-", "")
         try:
-            client = await get_client(user_id)
+            client = await get_connected_client()
             await client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["phone_code_hash"])
-            state["is_authorized"] = True
             state["pending_action"] = None
+            logger.info("Пользователь успешно авторизовался")
             await update.message.reply_text("✅ Успешный вход!", reply_markup=main_menu_keyboard())
         except SessionPasswordNeededError:
             state["pending_action"] = "await_password"
             await update.message.reply_text("🔒 Введи облачный пароль:")
         except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+            logger.warning("Неверный или просроченный код")
             await update.message.reply_text("❌ Неверный или просроченный код")
-            state["pending_action"] = None
         except Exception as e:
+            logger.error(f"Ошибка входа: {traceback.format_exc()}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
-            state["pending_action"] = None
-        return
 
-    if action == "await_password":
+    elif action == "await_password":
         try:
-            client = await get_client(user_id)
+            client = await get_connected_client()
             await client.sign_in(password=text)
-            state["is_authorized"] = True
             state["pending_action"] = None
+            logger.info("Пользователь вошёл с 2FA")
             await update.message.reply_text("✅ Успешный вход!", reply_markup=main_menu_keyboard())
         except Exception as e:
+            logger.error(f"Ошибка 2FA: {traceback.format_exc()}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
-            state["pending_action"] = None
-        return
 
-    if action == "await_draft":
+    elif action == "await_draft":
         state["draft_text"] = text
         state["pending_action"] = None
+        logger.info(f"Текст комментария изменён: {text}")
         await update.message.reply_text(f"✅ Новый текст:\n\n{text}")
-        return
 
-    if action == "await_channel_add":
+    elif action == "await_channel_add":
         channel = text.replace("@", "").strip()
         if channel and channel not in state["tracked_channels"]:
             state["tracked_channels"].append(channel)
-            all_channels = load_channels()
-            all_channels[str(user_id)] = state["tracked_channels"]
-            save_channels(all_channels)
+            save_channels(state["tracked_channels"])
+            state["pending_action"] = None
+            logger.info(f"Канал добавлен: @{channel}")
             await update.message.reply_text(f"✅ @{channel} добавлен!")
-        else:
-            await update.message.reply_text("⚠️ Канал уже в списке или пустой!")
-        state["pending_action"] = None
-        return
 
-    if action == "await_channel_remove":
+    elif action == "await_channel_remove":
         channel = text.replace("@", "").strip()
         if channel in state["tracked_channels"]:
             state["tracked_channels"].remove(channel)
-            all_channels = load_channels()
-            all_channels[str(user_id)] = state["tracked_channels"]
-            save_channels(all_channels)
+            save_channels(state["tracked_channels"])
+            state["pending_action"] = None
+            logger.info(f"Канал удалён: @{channel}")
             await update.message.reply_text(f"✅ @{channel} удалён!")
-        else:
-            await update.message.reply_text("⚠️ Канал не найден в списке!")
-        state["pending_action"] = None
-        return
 
-# ---------- ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK ----------
-async def health(request):
-    return web.Response(text="OK")
 
-async def run_web():
-    app = web.Application()
-    app.router.add_get("/health", health)
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-    log(f"🌐 Веб-сервер на порту {PORT}", "🌐")
-    await asyncio.Event().wait()
+# ══════════════════════════════════════════════
+# 🔄 KEEP-ALIVE
+# ══════════════════════════════════════════════
 
-# ---------- KEEP-ALIVE ----------
 async def keep_alive():
     while True:
         await asyncio.sleep(60)
-        for uid, st in user_states.items():
-            if st["client"] and st["client"].is_connected():
-                try:
-                    await st["client"].get_me()
-                except:
-                    pass
+        if state["client"] and state["monitoring"]:
+            try:
+                client = await get_connected_client()
+                await client.get_me()
+            except Exception as e:
+                logger.warning(f"Keep-alive ошибка: {e}")
 
-# ---------- ЗАПУСК ----------
+
+# ══════════════════════════════════════════════
+# 🚀 ЗАПУСК
+# ══════════════════════════════════════════════
+
 async def main():
-    print("\n  ⚡ БОТ-КОММЕНТАТОР\n")
-    # Запускаем веб-сервер в фоне
-    asyncio.create_task(run_web())
+    global bot_app
+
+    state["tracked_channels"] = load_channels()
+
+    logger.info("=" * 50)
+    logger.info("БОТ-КОММЕНТАТОР ЗАПУСКАЕТСЯ")
+    logger.info("=" * 50)
 
     app = Application.builder().token(BOT_TOKEN).build()
+    bot_app = app
+
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    log("✅ Бот готов!", "✅")
+
+    logger.info("✅ Бот готов к работе!")
+
     asyncio.create_task(keep_alive())
+
     await asyncio.Event().wait()
 
+
 if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.run(main())
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
-        print("\n  👋 Бот остановлен")
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
-        # Перезапуск при падении
-        os.execv(sys.executable, ['python'] + sys.argv)
+        logger.info("👋 Бот остановлен!")
+    finally:
+        loop.close()
