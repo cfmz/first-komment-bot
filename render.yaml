@@ -1,6 +1,6 @@
 # render.yaml
 services:
-  - type: worker
+  - type: web
     name: komment-bot
     env: python
     region: frankfurt
@@ -10,5 +10,3 @@ services:
     envVars:
       - key: BOT_TOKEN
         value: 8997883874:AAG1H8eF-b2y47kXV82uxwtlzQ_zrSxgzE8
-      - key: PYTHON_VERSION
-        value: 3.11.0
