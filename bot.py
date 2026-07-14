@@ -1,3 +1,4 @@
+# bot.py
 import asyncio
 import json
 import logging
@@ -23,6 +24,9 @@ from telegram.ext import (
     filters,
 )
 
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
 # ══════════════════════════════════════════════
 # 🔐 ДАННЫЕ
 # ══════════════════════════════════════════════
@@ -31,6 +35,7 @@ API_HASH = "f623dc4ae2b015463cfde7874ab0f270"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8997883874:AAG1H8eF-b2y47kXV82uxwtlzQ_zrSxgzE8")
 SESSION_FILE = "user_session"
 CHANNELS_FILE = "channels.json"
+PORT = int(os.environ.get("PORT", 8000))
 
 # ══════════════════════════════════════════════
 # 📝 ЛОГИРОВАНИЕ
@@ -129,7 +134,7 @@ async def get_connected_client() -> TelegramClient:
         try:
             await client.connect()
             if client.is_connected():
-                logger.info("🔄 Клиент переподключен")
+                logger.info("Клиент переподключен")
                 return client
         except Exception as e:
             if "AuthRestartError" in str(e) or "restart" in str(e).lower():
@@ -197,7 +202,7 @@ async def handle_new_message(event):
     title = getattr(chat, "title", str(chat.id))
     comment_text = fmt_draft(state["draft_text"])
 
-    logger.info(f"📩 Новый пост в канале: {title}")
+    logger.info(f"Новый пост в канале: {title}")
 
     asyncio.create_task(_send_with_retry(chat.id, event.message.id, comment_text, title, key))
 
@@ -207,10 +212,9 @@ async def _send_with_retry(channel_id, message_id, text, title, key):
     success = await send_comment(channel_id, message_id, text)
 
     if success:
-        logger.info(f"✅ Комментарий опубликован: {title} — {text}")
+        logger.info(f"Комментарий опубликован: {title} — {text}")
         print(f">>> {title}: {text}")
 
-        # ── Уведомление владельцу ──
         if state["owner_chat_id"] and bot_app:
             try:
                 link = make_post_link(channel_id, message_id)
@@ -221,7 +225,6 @@ async def _send_with_retry(channel_id, message_id, text, title, key):
             except Exception as e:
                 logger.error(f"Не удалось отправить уведомление: {e}")
 
-        # ── Первый комментарий за запуск ──
         if not state["first_comment_sent"]:
             state["first_comment_sent"] = True
             if state["owner_chat_id"] and bot_app:
@@ -239,7 +242,7 @@ async def _send_with_retry(channel_id, message_id, text, title, key):
                 except Exception as e:
                     logger.error(f"Не удалось отправить уведомление о первом комментарии: {e}")
     else:
-        logger.error(f"❌ Не удалось отправить комментарий в канал: {title}")
+        logger.error(f"Не удалось отправить комментарий в канал: {title}")
         state["notified_keys"].discard(key)
 
 
@@ -268,7 +271,7 @@ async def send_comment(channel_id: int, message_id: int, text: str) -> bool:
                 pass
 
         except FloodWaitError as fw:
-            logger.warning(f"⏳ FloodWait: {fw.seconds}с (попытка {attempt})")
+            logger.warning(f"FloodWait: {fw.seconds}с (попытка {attempt})")
         except Exception as e:
             logger.error(f"Ошибка отправки (попытка {attempt}): {e}")
             state["client"] = None
@@ -327,12 +330,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["notified_keys"].clear()
         state["first_comment_sent"] = False
         register_handler(await get_connected_client())
-        logger.info("▶️ Мониторинг запущен")
+        logger.info("Мониторинг запущен")
         await query.message.reply_text(f"▶️ ЗАПУЩЕНО!\n\n💬 {state['draft_text']}\n⚡ Мгновенно")
 
     elif data == "stop_monitoring":
         state["monitoring"] = False
-        logger.info("⏹ Мониторинг остановлен")
+        logger.info("Мониторинг остановлен")
         await query.message.reply_text("⏹ Остановлено!")
 
     elif data == "set_draft":
@@ -380,7 +383,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["client"] = None
         state["monitoring"] = False
         state["notified_keys"].clear()
-        logger.info("🚪 Пользователь вышел из аккаунта")
+        logger.info("Пользователь вышел из аккаунта")
         await query.message.reply_text("🚪 Вышел!")
 
 
@@ -478,6 +481,18 @@ async def keep_alive():
 
 
 # ══════════════════════════════════════════════
+# 🌐 FASTAPI ДЛЯ WEB SERVICE
+# ══════════════════════════════════════════════
+
+fastapi_app = FastAPI()
+
+
+@fastapi_app.get("/")
+async def home():
+    return JSONResponse({"status": "ok", "bot": "running"})
+
+
+# ══════════════════════════════════════════════
 # 🚀 ЗАПУСК
 # ══════════════════════════════════════════════
 
@@ -501,7 +516,7 @@ async def main():
     await app.start()
     await app.updater.start_polling()
 
-    logger.info("✅ Бот готов к работе!")
+    logger.info("Бот готов к работе!")
 
     asyncio.create_task(keep_alive())
 
@@ -509,11 +524,19 @@ async def main():
 
 
 if __name__ == "__main__":
+    import uvicorn
+    from threading import Thread
+
+    def run_fastapi():
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=PORT)
+
+    Thread(target=run_fastapi, daemon=True).start()
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
-        logger.info("👋 Бот остановлен!")
+        logger.info("Бот остановлен!")
     finally:
         loop.close()
