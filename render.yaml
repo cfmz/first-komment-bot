@@ -4,8 +4,11 @@ services:
     name: komment-bot
     env: python
     region: frankfurt
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false
+        value: 8997883874:AAG1H8eF-b2y47kXV82uxwtlzQ_zrSxgzE8
+      - key: PYTHON_VERSION
+        value: 3.11.0
